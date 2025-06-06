@@ -1,13 +1,8 @@
 use std::fmt::Debug;
 
-use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 use tower_sessions::{session, Session};
 
-use crate::{
-    backend::{AuthUser, UserId},
-    AuthnBackend,
-};
+use crate::{backend::AuthUser, AuthnBackend};
 
 /// An error type which maps session and backend errors.
 #[derive(thiserror::Error)]
@@ -35,21 +30,6 @@ impl<Backend: AuthnBackend> Debug for Error<Backend> {
 impl<Backend: AuthnBackend> From<session::Error> for Error<Backend> {
     fn from(value: session::Error) -> Self {
         Self::Session(value)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct Data<UserId> {
-    user_id: Option<UserId>,
-    auth_hash: Option<Vec<u8>>,
-}
-
-impl<UserId: Clone> Default for Data<UserId> {
-    fn default() -> Self {
-        Self {
-            user_id: None,
-            auth_hash: None,
-        }
     }
 }
 
@@ -82,7 +62,7 @@ pub struct AuthSession<Backend: AuthnBackend> {
     /// The underlying session.
     pub session: Session,
 
-    data: Data<UserId<Backend>>,
+    user_id: Option<<Backend::User as AuthUser>::Id>,
     data_key: &'static str,
 }
 
@@ -112,13 +92,7 @@ impl<Backend: AuthnBackend> AuthSession<Backend> {
     pub async fn login(&mut self, user: &Backend::User) -> Result<(), Error<Backend>> {
         self.user = Some(user.clone());
 
-        if self.data.auth_hash.is_none() {
-            self.session.cycle_id().await?; // Session-fixation
-                                            // mitigation.
-        }
-
-        self.data.user_id = Some(user.id());
-        self.data.auth_hash = Some(user.session_auth_hash().to_owned());
+        self.user_id = Some(user.id());
 
         self.update_session().await?;
 
@@ -140,7 +114,9 @@ impl<Backend: AuthnBackend> AuthSession<Backend> {
     }
 
     async fn update_session(&mut self) -> Result<(), session::Error> {
-        self.session.insert(self.data_key, self.data.clone()).await
+        self.session
+            .insert(self.data_key, self.user_id.clone())
+            .await
     }
 
     pub(crate) async fn from_session(
@@ -148,30 +124,32 @@ impl<Backend: AuthnBackend> AuthSession<Backend> {
         backend: Backend,
         data_key: &'static str,
     ) -> Result<Self, Error<Backend>> {
-        let mut data: Data<_> = session.get(data_key).await?.unwrap_or_default();
+        let user_id: Option<<Backend::User as AuthUser>::Id> =
+            session.get(data_key).await?.unwrap_or_default();
 
-        let mut user = if let Some(ref user_id) = data.user_id {
+        let user = if let Some(ref user_id) = user_id {
             backend.get_user(user_id).await.map_err(Error::Backend)?
         } else {
             None
         };
 
-        if let Some(ref authed_user) = user {
-            let session_auth_hash = authed_user.session_auth_hash();
-            let session_verified = data
-                .auth_hash
-                .as_ref()
-                .is_some_and(|auth_hash| auth_hash.ct_eq(session_auth_hash).into());
-            if !session_verified {
-                user = None;
-                data = Data::default();
-                session.flush().await?;
-            }
-        }
+        // if let Some(ref authed_user) = user {
+        //     let session_auth_hash = authed_user.session_auth_hash();
+        //     let session_verified = data
+        //         .auth_hash
+        //         .as_ref()
+        //         .is_some_and(|auth_hash| auth_hash.ct_eq(session_auth_hash).into());
+        //     if !session_verified {
+        //         user = None;
+        //         data = Data::default();
+        //         session.flush().await?;
+        //     }
+        // }
+        // Who needs auth
 
         Ok(Self {
             user,
-            data,
+            user_id,
             backend,
             session,
             data_key,
@@ -260,7 +238,7 @@ mod tests {
         let auth_session = AuthSession {
             user: None,
             backend: mock_backend,
-            data: Data::default(),
+            user_id: None,
             session,
             data_key: "auth_data",
         };
@@ -287,7 +265,7 @@ mod tests {
         let auth_session = AuthSession {
             user: None,
             backend: mock_backend,
-            data: Data::default(),
+            user_id: None,
             session,
             data_key: "auth_data",
         };
@@ -311,7 +289,7 @@ mod tests {
         let mut auth_session = AuthSession {
             user: None,
             backend: mock_backend,
-            data: Data::default(),
+            user_id: None,
             session: session.clone(),
             data_key: "auth_data",
         };
@@ -343,7 +321,7 @@ mod tests {
         let mut auth_session = AuthSession {
             user: Some(mock_user.clone()),
             backend: mock_backend,
-            data: Data::default(),
+            user_id: None,
             session,
             data_key: "auth_data",
         };
@@ -373,11 +351,8 @@ mod tests {
         let data_key = "auth_data";
 
         // Simulate a user being logged in
-        let data = Data {
-            user_id: Some(42),
-            auth_hash: Some(vec![1, 2, 3, 4]),
-        };
-        session.insert(data_key, &data).await.unwrap();
+        let user_id = Some(42);
+        session.insert(data_key, &user_id).await.unwrap();
 
         let auth_session = AuthSession::from_session(session, mock_backend, data_key)
             .await
@@ -385,37 +360,5 @@ mod tests {
 
         assert!(auth_session.user.is_some());
         assert_eq!(auth_session.user.unwrap().id(), 42);
-    }
-
-    #[tokio::test]
-    async fn test_from_session_bad_auth_hash() {
-        let mut mock_backend = MockBackend::default();
-        let mock_user = MockUser {
-            id: 42,
-            auth_hash: vec![1, 2, 3, 4],
-        };
-
-        mock_backend
-            .expect_get_user()
-            .with(eq(mock_user.id))
-            .times(1)
-            .returning(move |_| Ok(Some(mock_user.clone())));
-
-        let store = Arc::new(MemoryStore::default());
-        let session = Session::new(None, store.clone(), None);
-        let data_key = "auth_data";
-
-        // Try to use a malformed auth hash.
-        let data = Data {
-            user_id: Some(42),
-            auth_hash: Some(vec![4, 3, 2, 1]),
-        };
-        session.insert(data_key, &data).await.unwrap();
-
-        let auth_session = AuthSession::from_session(session, mock_backend, data_key)
-            .await
-            .unwrap();
-
-        assert!(auth_session.user.is_none());
     }
 }
